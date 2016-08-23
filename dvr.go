@@ -9,8 +9,33 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
-	"strings"
 	"sync"
+)
+
+var (
+	transcoderArgs = [][]string{
+		[]string{
+			"720p",
+			"-b:v", "1500k",
+			"-maxrate", "1500k",
+			"-bufsize", "1000k",
+			"-vf", "scale=-1:720",
+		},
+		[]string{
+			"540",
+			"-b:v", "800k",
+			"-maxrate", "800k",
+			"-bufsize", "500k",
+			"-vf", "scale=-1:540",
+		},
+		[]string{
+			"360",
+			"-b:v", "400k",
+			"-maxrate", "400k",
+			"-bufsize", "400k",
+			"-vf", "scale=-1:360",
+		},
+	}
 )
 
 func usage(msg string) {
@@ -45,12 +70,15 @@ func newTranscoder(prefix string, args ...string) (*transcoder, error) {
 		fmt.Sprintf("output/%s-%%04d.mp4", prefix),
 	)
 
-	fmt.Fprintf(os.Stderr, "Command Args: %s\n", strings.Join(localArgs, " "))
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		return nil, err
+	}
 
-	t.cmd = exec.Command("/usr/local/bin/ffmpeg", localArgs...)
+	t.cmd = exec.Command(ffmpeg, localArgs...)
 	t.stdin, _ = t.cmd.StdinPipe()
 	t.stderr, _ = t.cmd.StderrPipe()
-	err := t.cmd.Start()
+	err = t.cmd.Start()
 	if err == nil {
 		t.wg.Add(1)
 		go func() {
@@ -93,62 +121,48 @@ func (t *transcoder) Close() error {
 	return err
 }
 
+func localAddr(deviceIP net.IP) (net.IP, error) {
+	for _, i := range assertFail(net.Interfaces()).([]net.Interface) {
+		for _, ip := range assertFail(i.Addrs()).([]net.Addr) {
+			if network, isNet := ip.(*net.IPNet); isNet && network.Contains(deviceIP) {
+				return network.IP, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("No interface is on the same network as %s", deviceIP.String())
+}
+
+func assertUsage(i interface{}, err error) interface{} {
+	if err != nil {
+		usage(err.Error())
+	}
+	return i
+}
+
+func assertFail(i interface{}, err error) interface{} {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Connection Error: %v", err)
+		os.Exit(-1)
+	}
+	return i
+}
+
 func main() {
 	if len(os.Args) < 4 {
 		usage("")
 	}
 
-	tcpAddr, err := net.ResolveTCPAddr("tcp", os.Args[1])
-	if err != nil {
-		usage(fmt.Sprintf("Invalid Address: %v", err))
+	tcpAddr := assertUsage(net.ResolveTCPAddr("tcp", os.Args[1])).(*net.TCPAddr)
+	frequency := assertUsage(strconv.ParseInt(os.Args[2], 10, 0)).(int64)
+	program := assertUsage(strconv.ParseInt(os.Args[3], 10, 0)).(int64)
+	lip := assertUsage(localAddr(tcpAddr.IP)).(net.IP)
+
+	device := assertFail(hdhomerun.ConnectTCP(tcpAddr)).(hdhomerun.Device)
+	if closer, closeable := device.(io.Closer); closeable {
+		defer closer.Close()
 	}
 
-	frequency, err := strconv.ParseInt(os.Args[2], 10, 0)
-	if err != nil {
-		usage(fmt.Sprintf("Failed to parse frequency: %v", err))
-	}
-
-	program, err := strconv.ParseInt(os.Args[3], 10, 0)
-	if err != nil {
-		usage(fmt.Sprintf("Failed to parse program: %v", err))
-	}
-
-	device, err := hdhomerun.ConnectTCP(tcpAddr)
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Connection Error: %v", err)
-		os.Exit(-1)
-	}
-
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{net.IP{172, 16, 6, 123}, 0, ""})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "UDP Connection Error: %v", err)
-		os.Exit(-1)
-	}
-
-	transcoderArgs := [][]string{
-		[]string{
-			"720p",
-			"-b:v", "1500k",
-			"-maxrate", "1500k",
-			"-bufsize", "1000k",
-			"-vf", "scale=-1:720",
-		},
-		[]string{
-			"540",
-			"-b:v", "800k",
-			"-maxrate", "800k",
-			"-bufsize", "500k",
-			"-vf", "scale=-1:540",
-		},
-		[]string{
-			"360",
-			"-b:v", "400k",
-			"-maxrate", "400k",
-			"-bufsize", "400k",
-			"-vf", "scale=-1:360",
-		},
-	}
+	conn := assertFail(net.ListenUDP("udp", &net.UDPAddr{lip, 0, ""})).(*net.UDPConn)
 
 	transcoders := []*transcoder{}
 	for _, args := range transcoderArgs {
@@ -177,40 +191,11 @@ func main() {
 	}()
 
 	tuner := device.Tuner(0)
-	err = tuner.Stream(int(frequency), int(program), conn.LocalAddr().(*net.UDPAddr))
+
+	err := tuner.Stream(int(frequency), int(program), conn.LocalAddr().(*net.UDPAddr))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to tune: %v\n", err)
 		os.Exit(-1)
 	}
 	wg.Wait()
 }
-
-/*var wg sync.WaitGroup
-wg.Add(1)
-go func() {
-	cmd := exec.Command("/usr/local/bin/ffmpeg",
-		"-i", "pipe:",
-		"-acodec", "copy",
-		"-vcodec", "libx264",
-		"-force_key_frames", "expr:gte(t,n_forced*5)",
-		"-f", "segment",
-		"-segment_time", "5",
-		`output/output-%03d.mp4`,
-	)
-	stdinPipe, _ := cmd.StdinPipe()
-	stderrPipe, _ := cmd.StderrPipe()
-	err := cmd.Start()
-	if err == nil {
-		go func() {
-			readBuffer := make([]byte, 1500)
-			for {
-				n, _ := stderrPipe.Read(readBuffer)
-				fmt.Fprintf(os.Stderr, "%s", string(readBuffer[0:n]))
-			}
-		}()
-		buffer := make([]byte, 1500)
-	} else {
-		fmt.Fprintf(os.Stderr, "Failed to spawn process: %v\n", err)
-	}
-	wg.Done()
-}()*/
